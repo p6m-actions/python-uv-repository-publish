@@ -1,34 +1,306 @@
-name: "Python Uv Repository Publish"
-description: "A simple GitHub Action that prints a greeting"
-author: "Jimmie Fulton <jimmie.fulton@gmail.com>"
+name: "Python UV Repository Publish"
+description: "A GitHub Action that builds and publishes Python packages to PyPI-compliant repositories using UV"
+author: "Jimmie Fulton <jimmie@ybor.ai>"
 
 # Define the inputs for this action
 inputs:
-  who-to-greet:
-    description: "Who to greet"
-    required: true
-    default: "World"
-  message:
-    description: "Custom message to include"
+  project-path:
+    description: "Path to the project directory containing pyproject.toml"
     required: false
-    default: "Hello"
+    default: "."
+  projects:
+    description: "Specific project paths to publish (one per line). If not specified, all publishable projects will be published"
+    required: false
+    default: ""
+  package-version:
+    description: "Version to assign to the packages. If not specified, uses project version"
+    required: false
+    default: ""
+  repositories:
+    description: "Repository names to publish to (one per line). Must match names configured in python-uv-repository-login. If not specified, publishes to all configured repositories"
+    required: false
+    default: ""
+  skip-existing:
+    description: "Skip publishing if package version already exists"
+    required: false
+    default: "true"
+  dry-run:
+    description: "Perform a dry run without actually publishing"
+    required: false
+    default: "false"
+  verbose:
+    description: "Enable verbose output"
+    required: false
+    default: "false"
 
 # Define the outputs for this action
 outputs:
-  time:
-    description: "The time we greeted you"
-    value: ${{ steps.hello.outputs.time }}
+  published-packages:
+    description: "List of successfully published packages with their versions"
+    value: ${{ steps.publish.outputs.published-packages }}
+  published-count:
+    description: "Number of packages successfully published"
+    value: ${{ steps.publish.outputs.published-count }}
+  skipped-packages:
+    description: "List of packages that were skipped (e.g., due to duplicates)"
+    value: ${{ steps.publish.outputs.skipped-packages }}
 
 # Define the runs configuration
 runs:
   using: "composite"
   steps:
-    - name: Hello step
-      id: hello
+    - name: Publish Python packages
+      id: publish
       shell: bash
       run: |
-        echo "${{ inputs.message }}, ${{ inputs.who-to-greet }}!"
-        echo "time=$(date)" >> $GITHUB_OUTPUT
+        set -e
+
+        published_packages=""
+        published_count=0
+        skipped_packages=""
+
+        echo "Starting Python package publishing process..."
+
+        # Function to log with timestamp
+        log() {
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+        }
+
+        # Ensure UV is available
+        if ! command -v uv &> /dev/null; then
+          log "Installing UV..."
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+        fi
+
+        # Verify UV installation
+        uv_version=$(uv --version)
+        log "Using UV: $uv_version"
+
+        # Find projects to publish
+        projects_to_publish=()
+        if [[ -n "${{ inputs.projects }}" ]]; then
+          log "Using specified projects from input"
+          while IFS= read -r project; do
+            if [[ -n "$project" && "$project" != \#* ]]; then
+              if [[ -d "$project" && -f "$project/pyproject.toml" ]]; then
+                projects_to_publish+=("$project")
+                log "Added project: $project"
+              else
+                log "Warning: Project directory not found or missing pyproject.toml: $project"
+              fi
+            fi
+          done <<< "${{ inputs.projects }}"
+        else
+          log "Discovering publishable projects..."
+          # Look for pyproject.toml files
+          if [[ -f "${{ inputs.project-path }}/pyproject.toml" ]]; then
+            projects_to_publish+=("${{ inputs.project-path }}")
+            log "Found project: ${{ inputs.project-path }}"
+          else
+            # Search for pyproject.toml files in subdirectories
+            while IFS= read -r -d '' project_file; do
+              project_dir=$(dirname "$project_file")
+              # Check if this looks like a publishable package
+              if grep -q -E "(name\s*=|version\s*=)" "$project_file" 2>/dev/null; then
+                projects_to_publish+=("$project_dir")
+                log "Found publishable project: $project_dir"
+              fi
+            done < <(find "${{ inputs.project-path }}" -name "pyproject.toml" -print0)
+          fi
+        fi
+
+        if [[ ${#projects_to_publish[@]} -eq 0 ]]; then
+          log "Error: No projects found to publish"
+          exit 1
+        fi
+
+        log "Found ${#projects_to_publish[@]} projects to publish"
+
+        # Parse repository configuration
+        target_repositories=()
+
+        if [[ -n "${{ inputs.repositories }}" ]]; then
+          while IFS= read -r repo; do
+            if [[ -n "$repo" && "$repo" != \#* ]]; then
+              target_repositories+=("$repo")
+            fi
+          done <<< "${{ inputs.repositories }}"
+          log "Will publish to specific repositories: ${target_repositories[*]}"
+        else
+          log "Will publish to all configured repositories"
+        fi
+
+        # Process each project
+        for project in "${projects_to_publish[@]}"; do
+          log "Processing project: $project"
+          
+          # Change to project directory
+          cd "$project"
+          
+          # Get project name from pyproject.toml (with fallback for older Python)
+          project_name=$(python -c "
+        try:
+            import tomllib
+        except ImportError:
+            try:
+                import tomli as tomllib
+            except ImportError:
+                import configparser, re
+                # Fallback parsing for basic cases
+                with open('pyproject.toml', 'r') as f:
+                    content = f.read()
+                    match = re.search(r'name\s*=\s*[\"\']([^\"\']*)[\"\']]', content)
+                    print(match.group(1) if match else 'unknown')
+                    exit()
+        with open('pyproject.toml', 'rb') as f:
+            data = tomllib.load(f)
+            print(data.get('project', {}).get('name', 'unknown'))
+        " 2>/dev/null || echo "unknown")
+          
+          log "Project name: $project_name"
+          
+          # Set version if specified
+          if [[ -n "${{ inputs.package-version }}" ]]; then
+            log "Setting version to: ${{ inputs.package-version }}"
+            # UV doesn't have a version set command, so we modify pyproject.toml directly
+            python -c "
+        import sys, re
+        try:
+            with open('pyproject.toml', 'r') as f:
+                content = f.read()
+            # Replace version in [project] section
+            content = re.sub(r'(\\[project\\][^\\[]*version\\s*=\\s*)[\"\'][^\"\']*)[\"\']]', 
+                           r'\\1\"${{ inputs.package-version }}\\\",', content)
+            with open('pyproject.toml', 'w') as f:
+                f.write(content)
+            print('Version updated successfully')
+        except Exception as e:
+            print(f'Warning: Could not update version: {e}', file=sys.stderr)
+            sys.exit(1)
+        "
+            if [[ $? -eq 0 ]]; then
+              log "Version set to ${{ inputs.package-version }}"
+            else
+              log "Warning: Could not set version in pyproject.toml"
+            fi
+          fi
+          
+          # Build the package
+          log "Building package for $project_name..."
+          build_args=""
+          
+          if [[ "${{ inputs.verbose }}" == "true" ]]; then
+            build_args="$build_args --verbose"
+          fi
+          
+          if [[ "${{ inputs.dry-run }}" == "true" ]]; then
+            log "DRY RUN: Would execute: uv build $build_args"
+            built_packages=("${project_name}-1.0.0-py3-none-any.whl" "${project_name}-1.0.0.tar.gz")
+          else
+            if uv build $build_args; then
+              log "✓ Successfully built $project_name"
+              # Find built packages
+              built_packages=($(find ./dist -name "*.whl" -o -name "*.tar.gz" 2>/dev/null || true))
+            else
+              log "✗ Failed to build $project_name"
+              cd - > /dev/null
+              continue
+            fi
+          fi
+          
+          if [[ ${#built_packages[@]} -eq 0 ]]; then
+            log "Warning: No built packages found for $project_name"
+            cd - > /dev/null
+            continue
+          fi
+          
+          # Publish packages
+          for package_file in "${built_packages[@]}"; do
+            package_filename=$(basename "$package_file")
+            log "Publishing package: $package_filename"
+            
+            # Build publish arguments
+            publish_args=""
+            
+            # Add repository if specified
+            if [[ ${#target_repositories[@]} -gt 0 ]]; then
+              for repo in "${target_repositories[@]}"; do
+                log "Publishing to repository: $repo"
+                repo_publish_args="--repository $repo"
+                
+                if [[ "${{ inputs.skip-existing }}" == "true" ]]; then
+                  repo_publish_args="$repo_publish_args --skip-existing"
+                fi
+                
+                if [[ "${{ inputs.verbose }}" == "true" ]]; then
+                  repo_publish_args="$repo_publish_args --verbose"
+                fi
+                
+                if [[ "${{ inputs.dry-run }}" == "true" ]]; then
+                  log "DRY RUN: Would execute: uv publish $repo_publish_args $package_file"
+                  published_packages="${published_packages}${package_filename}@${repo},"
+                  ((published_count++))
+                else
+                  if uv publish $repo_publish_args "$package_file"; then
+                    log "✓ Successfully published $package_filename to $repo"
+                    published_packages="${published_packages}${package_filename}@${repo},"
+                    ((published_count++))
+                  elif [[ "${{ inputs.skip-existing }}" == "true" ]]; then
+                    log "⚠ Package $package_filename already exists in $repo (skipped)"
+                    skipped_packages="${skipped_packages}${package_filename}@${repo},"
+                  else
+                    log "✗ Failed to publish $package_filename to $repo"
+                  fi
+                fi
+              done
+            else
+              # Publish to all configured repositories
+              if [[ "${{ inputs.skip-existing }}" == "true" ]]; then
+                publish_args="$publish_args --skip-existing"
+              fi
+              
+              if [[ "${{ inputs.verbose }}" == "true" ]]; then
+                publish_args="$publish_args --verbose"
+              fi
+              
+              if [[ "${{ inputs.dry-run }}" == "true" ]]; then
+                log "DRY RUN: Would execute: uv publish $publish_args $package_file"
+                published_packages="${published_packages}${package_filename},"
+                ((published_count++))
+              else
+                if uv publish $publish_args "$package_file"; then
+                  log "✓ Successfully published $package_filename"
+                  published_packages="${published_packages}${package_filename},"
+                  ((published_count++))
+                elif [[ "${{ inputs.skip-existing }}" == "true" ]]; then
+                  log "⚠ Package $package_filename already exists (skipped)"
+                  skipped_packages="${skipped_packages}${package_filename},"
+                else
+                  log "✗ Failed to publish $package_filename"
+                fi
+              fi
+            fi
+          done
+          
+          # Return to original directory
+          cd - > /dev/null
+        done
+
+        # Clean up trailing commas
+        published_packages=${published_packages%,}
+        skipped_packages=${skipped_packages%,}
+
+        # Set outputs
+        echo "published-packages=$published_packages" >> $GITHUB_OUTPUT
+        echo "published-count=$published_count" >> $GITHUB_OUTPUT
+        echo "skipped-packages=$skipped_packages" >> $GITHUB_OUTPUT
+
+        log "Publishing complete!"
+        log "Published packages: $published_packages"
+        log "Published count: $published_count"
+        log "Skipped packages: $skipped_packages"
 
 # Define the branding for the action in the GitHub Marketplace
 branding:

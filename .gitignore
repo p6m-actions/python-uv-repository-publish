@@ -1,3 +1,7 @@
+dotnet-repository-publish
+python-uv-cut-tag
+python-uv-setup
+
 ### IntelliJ IDEA project files ###
 .idea/
 *.iws
